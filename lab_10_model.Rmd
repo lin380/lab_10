@@ -1,0 +1,329 @@
+---
+title: "Lab 10 (model)"
+author: "Jerid Francom"
+date: "11/13/2021"
+output: 
+  pdf_document: 
+    toc: yes
+    number_sections: yes
+  html_document: 
+    toc: yes
+    number_sections: yes
+bibliography: bibliography.bib
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)           # data manipulation
+library(quanteda)            # tokenization and document-frequency matrices
+library(quanteda.textstats)  # descriptive text statistics
+library(quanteda.textmodels) # Naive Bayes classifier
+
+source("functions/functions.R") # plot_indicative_features(), evaluate_training_model()
+knitr::opts_chunk$set(echo = FALSE) # do not show code by default
+```
+
+# Overview
+
+The aim of this script will be creating a predictive model for author detection. Specifically we will try to correctly predict the author of the once [disputed Federalist papers](https://en.wikipedia.org/wiki/The_Federalist_Papers). The disputed papers involved the debate whether "Alexander Hamilton" or "James Madison" was the author of some or all of the papers. Modern opinion is that James Madison is the author of the disputed papers [@Mosteller1963]. We will use the same data available to earlier scholars to build a Naive Bayes Text Classifier aimed a predicting the author(s) of the disputed papers. 
+
+# Tasks
+
+## Orientation
+
+Let's read the curated federalist papers dataset and look preview it.
+
+```{r fed-df-read-dataset, message=FALSE}
+fed_df <- 
+  read_csv(file = "data/derived/federalist_papers_curated.csv") # read curated dataset
+
+glimpse(fed_df) # preview dataset
+```
+
+There are 85 observations and 5 columns. 
+
+Now let's look at the data dictionary associated with this the curated dataset.
+
+```{r fed-df-read-data-dictionary, message=FALSE}
+fed_data_dictionary <- read_csv(file = "data/derived/federalist_papers_curated_data_dictionary.csv") # read data dictionary
+
+fed_data_dictionary %>% 
+  print_pretty_table(caption = "Federalist papers data dictionary.")
+```
+
+Let's create a cross-tabulation of the `author` and `disputed` columns to see the relationship between the authors and the disputed status.
+
+```{r fed-df-description}
+fed_df %>% 
+  janitor::tabyl(author, disputed)
+```
+
+We see that there are 15 disputed papers. According to modern opinion these papers are associated with "James Madison".
+
+## Preparation 
+
+Now let's create Quanteda corpus object `fed_corpus` from the `fed_df` data frame and view a summary of the object.
+
+```{r fed-corpus-create}
+# Create corpus object
+fed_corpus <- 
+  fed_df %>% # data frame
+  select(-title) %>% # remove the title column
+  corpus() # create the corpus object
+
+fed_corpus %>% 
+  summary(n = 10)
+```
+
+The 85 documents appear in the corpus. The `author` and `disputed` columns are included as document variables.
+
+Remove the "John Jay" authored papers as he is not considered as one of the authors of the disputed papers.
+
+```{r fed-corpus-subset}
+fed_corpus <- 
+  fed_corpus %>% # corpus objuect
+  corpus_subset(author != "John Jay") # remove John Jay authored papers
+
+fed_corpus %>% 
+  summary(n = 10)
+```
+
+There are now five less documents after removing the John Jay papers. 
+
+## Feature engineering
+
+Tokenize the `fed_corpus` object into words. We will also remove punctuation and numbers and lowercase the text. 
+
+```{r fed-tokens-create}
+fed_tokens <- 
+  tokens(fed_corpus, # corpus object
+         what = "word", # tokenize by word
+         remove_punct = TRUE, # remove punctuation
+         remove_numbers = TRUE) %>% # remove numbers
+  tokens_tolower() # lowercase the tokens
+
+fed_tokens %>% # tokens object
+  head(n = 5) # view the first observations
+```
+
+Create a Document-Frequency Matrix (DFM) object where the tokens are features and the papers are documents. 
+
+```{r fed-dfm-create}
+fed_dfm <- 
+  dfm(fed_tokens) # create document-frequency matrix
+
+fed_dfm %>% # dfm object
+  head(n = 5) # preview
+```
+
+There are `r nfeat(fed_dfm)` word features in the matrix which is `r round(sparsity(fed_dfm), 2)` sparse.
+
+Let's look at the 20 most frequent features in the matrix.
+
+```{r fed-dfm-topfeatures}
+fed_dfm %>% # dfm object
+  topfeatures(n = 20) # view most frequent features
+```
+
+Now let's look at the 10 most frequency features and then group them by `author`. 
+
+```{r fed-dfm-topfeatures-author}
+fed_dfm %>% # dfm object
+  textstat_frequency(n = 10, groups = author) # get top frequency grouped by author
+```
+
+Visualize the top features by `author`. 
+
+```{r fed-dfm-topfeatures-author-view}
+fed_dfm %>% # dfm
+  textstat_frequency(n = 25, groups = author) %>% # get top frequency grouped by author
+  ggplot(aes(x = reorder(feature, frequency), 
+             y = frequency, 
+             fill = group)) + # mappings
+  geom_col(show.legend = FALSE) + # bar plot (with no legend)
+  coord_flip() + # flip x/y coordinates
+  facet_wrap(~group, scales = "free") + # create separate plots for each author
+  labs(x = "Words", y = "Raw frequency") # labels
+```
+
+There are quite a few features that appear frequently in the papers of each author. 
+
+Let's explore weighing the raw frequency count to take into account the frequency that terms appear in across documents. I will apply the Term Frequency-Inverse Document Frequency to weigh the raw counts and visualize the top features by `author`. 
+
+```{r fed-dfm-weighted-topfeatures-author-view}
+fed_dfm %>% # dfm
+  dfm_tfidf() %>% # weigh frequency by tf-idf
+  textstat_frequency(n = 25, groups = author, force = TRUE) %>% # get top frequency grouped by author
+  ggplot(aes(x = reorder(feature, frequency), 
+             y = frequency, 
+             fill = group)) + # mappings
+  geom_col(show.legend = FALSE) + # bar plot (with no legend)
+  coord_flip() + # flip x/y coordinates
+  facet_wrap(~group, scales = "free") + # create separate plots for each author
+  labs(x = "Words", y = "TF-IDF") # labels
+```
+
+We see that the TF-IDF weights help distinguish top features between the authors. We will continue for the moment with the unweighted raw frequency counts, but keep this in mind if the predictive model does not perform well.
+
+
+Now I will split the unweighted `fed_dfm` matrix into training `fed_dfm_train` and testing `fed_dfm_test` matrices. In this case the 'training' data are the undisputed papers and the testing data are the disputed papers.
+
+```{r fed-dfm-train-test}
+# Create training and testing dfms
+fed_dfm_train <- 
+  fed_dfm %>% 
+  dfm_subset(disputed == FALSE)
+
+fed_dfm_train %>% 
+  docvars() %>% 
+  janitor::tabyl(author)
+
+fed_dfm_test <- 
+  fed_dfm %>% 
+  dfm_subset(disputed == TRUE)
+
+fed_dfm_test %>% 
+  docvars() %>% 
+  janitor::tabyl(author)
+```
+
+Contrasts in the proportions between the training and testing sets are not relevant here as the test set is composed solely of papers purported to be written by James Madison.
+
+
+## Model training
+
+We will use the Naive Bayes Text Classifier to generate a model that attempts to learn the differences between language usage (unweighted word counts) between Alexander Hamilton and James Madison. We will look at the model summary and preview feature and document probabilities.
+
+```{r fed-fit-model}
+# Train model
+nb1 <- 
+  textmodel_nb(x = fed_dfm_train, # document-feature matrix
+               y = fed_dfm_train$author) # class labels
+
+summary(nb1) # model summary
+```
+
+The fit model assumes both authors are equally likely (priors 0.5 for each author). We see a preview of the estimated probability scores for each feature. To get a better look at the top features I will apply the `plot_indicative_features()` custom function.
+
+```{r fed-fit-explore}
+plot_indicative_features(nb_model = nb1, top_n = 25)
+```
+
+We see that there are distinct features, as expected. However, the top features for Alexander Hamilton are weighted more heavily. It is likely that many of these words will also appear in the James Madison papers (i.e. 'the', 'of', etc.) so this may lead to lower accuracy scores on the test set.
+
+Let's evaluate the `nb1` model's performance on the training dataset itself.
+
+```{r nb1-evaluate}
+evaluate_training_model(nb1, classes = c("Alexander Hamilton", "James Madison"))
+```
+
+The results appear to be perfect. High scores on the training dataset are expected as the same dataset to train is used to evaluate. The question is whether the model features will generalize to the testing data.
+
+## Model testing
+
+We now use the trained model `nb1` to predict the author(s) of the disputed papers and view the predictions.
+
+```{r fed-test-model-predictions}
+# Test model predictions
+dfm_matched <- 
+  dfm_match(fed_dfm_test, # test dfm
+            features = featnames(nb1$x)) # (left) join with trained model features
+
+predicted_class <- predict(nb1, newdata = dfm_matched) # apply model to test dataset
+
+predicted_class %>% 
+  as_tibble(rownames = "names") %>% # convert to tibble with rownames as a column
+  select(doc_id = names, prediction = value) %>% # rename columns
+  arrange(doc_id) # sort by doc_id
+```
+We can see that many documents are predicted to have been authored by Alexander Hamilton --not the desired result.
+
+## Evaluation
+
+Retrieve previously suggested author(s) of the disputed papers (i.e., "James Madison") and compare to the predictions made by our text classification model with a confusion matrix.
+
+```{r fed-evaluate-predictions}
+# Evaluate
+actual_class <- dfm_matched$author # get actual class labels
+
+tab_class <- table(actual_class, predicted_class) # cross-tabulate actual and predicted class labels
+
+tab_class
+```
+
+The confusion matrix for the results of the model on the testing dataset suggests that the model does not perform well.
+
+## Model improvement
+
+Let's return to the idea of weighing the raw frequency counts to highlight most indicative features across all the documents by using TF-IDF weights. We will also create new training/ testing splits.
+
+```{r fed-dfm-weighted-tfidf}
+fed_dfm <- 
+  fed_dfm %>% 
+  dfm_tfidf()  # weight by term-frequency inverse-document frequency
+
+fed_dfm_train <- 
+  fed_dfm %>% 
+  dfm_subset(disputed == FALSE)
+
+fed_dfm_test <- 
+  fed_dfm %>% 
+  dfm_subset(disputed == TRUE)
+```
+
+Train the new model again using the Naive Bayes Text Classifier to generate a model. This new model `nb2` is now based on weighted (TF-IDF) word usage. 
+
+```{r fed-weighted-fit-model}
+nb2 <- 
+  textmodel_nb(x = fed_dfm_train, # document-feature matrix
+               y = fed_dfm_train$author) # class labels
+```
+
+Evaluate trained `nb2` model.
+
+```{r nb2-evaluate}
+evaluate_training_model(nb2, classes = c("Alexander Hamilton", "James Madison"))
+```
+
+Let's look at the most indicative features for each author.
+
+```{r fed-weighted-fit-explore}
+plot_indicative_features(nb_model = nb2, top_n = 25)
+```
+
+The features here are less common words which bodes well for helping our predictive model distinguish between the two authors.
+
+
+Let's apply our new `nb2` model to the testing dataset.
+
+```{r fed-test-model-weighted-predictions}
+# Test model predictions
+dfm_matched <- 
+  dfm_match(fed_dfm_test, # test dfm
+            features = featnames(nb2$x)) # (left) join with trained model features
+
+predicted_class <- predict(nb2, newdata = dfm_matched) 
+
+predicted_class %>% 
+  as_tibble(rownames = "names") %>% # convert to tibble with rownames as a column
+  select(doc_id = names, prediction = value) %>% # rename columns
+  arrange(doc_id) # sort by doc_id
+```
+
+We can see that all the documents, except one, were predicted to be authored by James Madison --very close to our desired result.
+
+Evaluate the predictions and produce a confusion matrix.
+
+```{r fed-evaluate-weighted-predictions}
+# Evaluate
+actual_class <- dfm_matched$author # get actual class labels
+
+tab_class <- table(actual_class, predicted_class) # cross-tabulate actual and predicted class labels
+
+tab_class
+```
+
+The confusion matrix for the results of the model on the testing dataset suggests that the model performs much better, although not perfect.
+
+# Assessment
+
+...

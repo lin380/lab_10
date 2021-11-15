@@ -1,0 +1,6 @@
+variable_name,name,description
+doc_id,Document ID,Unique ID for each of the Federalist Papers
+title,Title,Title of each of the papers
+author,Author,Accepted authors of each of the papers
+disputed,Disputed,Whether the authorship has been disputed
+text,Text,Text contents of each of the papers
